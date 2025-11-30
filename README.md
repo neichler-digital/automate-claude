@@ -17,7 +17,7 @@ A command-line tool for running multiple Claude Code commands sequentially with 
 
 ### Pre-built Binary
 
-A static binary is provided and can be used directly without compilation. Currently only tested on Ubuntu.
+Pre-built static binaries are available on the [releases page](https://github.com/neichler-digital/automate-claude/releases). Currently only tested on Ubuntu.
 
 ```bash
 ./automate-claude --help
