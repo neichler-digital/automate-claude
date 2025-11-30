@@ -1,0 +1,5 @@
+.build/
+.claude/
+claude_runs/
+output/
+COMPLETE_JAI_AI_REFERENCE.md
