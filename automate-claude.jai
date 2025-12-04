@@ -173,19 +173,30 @@ run_claude_via_script :: (command: string, headless_mode: bool, skip_perms: bool
     }
     defer if suffix > 0 then free(delimiter);
 
+    // Ensure command ends with newline for heredoc - bash requires the delimiter
+    // to be on its own line, so if content doesn't end with \n, the delimiter
+    // won't be recognized and we get "here-document delimited by end-of-file"
+    command_with_newline := command;
+    allocated_newline := false;
+    if command.count > 0 && command[command.count - 1] != #char "\n" {
+        command_with_newline = sprint("%\n", command);
+        allocated_newline = true;
+    }
+    defer if allocated_newline then free(command_with_newline);
+
     script_cmd: string;
     if headless_mode {
         script_cmd = sprint(#string HEREDOC
 env IS_SANDBOX=1 claude % << '%'
 %
 %
-HEREDOC, claude_flags, delimiter, command, delimiter);
+HEREDOC, claude_flags, delimiter, command_with_newline, delimiter);
     } else {
         script_cmd = sprint(#string HEREDOC
 claude % << '%'
 %
 %
-HEREDOC, claude_flags, delimiter, command, delimiter);
+HEREDOC, claude_flags, delimiter, command_with_newline, delimiter);
     }
     defer free(script_cmd);
 
