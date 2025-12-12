@@ -150,6 +150,53 @@ extract_result_from_stream_json :: (line: string) -> string, bool {
     return copy_string(result_val.str), true;
 }
 
+// Clean terminal output by removing binary/garbled data and bash warnings
+// The script command captures raw terminal output which can include control characters,
+// binary data, and stderr warnings mixed with stdout
+clean_terminal_output :: (input: string) -> string {
+    builder: String_Builder;
+
+    lines := split(input, "\n");
+    first_line := true;
+
+    for line: lines {
+        // Skip bash heredoc warnings that get mixed into output
+        if contains(line, "here-document") && contains(line, "delimited by end-of-file") continue;
+        if contains(line, "wanted") && contains(line, "CLAUDE_INPUT_EOF") continue;
+
+        // Skip lines that are mostly non-printable (binary/garbled data)
+        printable_count := 0;
+        total_count := 0;
+        for i: 0..line.count-1 {
+            c := line[i];
+            total_count += 1;
+            // Count printable ASCII and common UTF-8 continuation bytes
+            if (c >= 32 && c < 127) || c == #char "\t" || c == #char "\r" {
+                printable_count += 1;
+            }
+        }
+
+        // Skip lines where less than 50% is printable (likely binary)
+        if total_count > 0 && printable_count * 100 / total_count < 50 continue;
+
+        // Add newline between lines
+        if !first_line {
+            append(*builder, "\n");
+        }
+        first_line = false;
+
+        // Copy the line, filtering out non-printable characters
+        for i: 0..line.count-1 {
+            c := line[i];
+            if (c >= 32 && c < 127) || c == #char "\t" {
+                append(*builder, c);
+            }
+        }
+    }
+
+    return builder_to_string(*builder);
+}
+
 // Helper to run a Claude command via script with proper shell and flushing
 // Returns: result, stdout, stderr, timed_out
 run_claude_via_script :: (command: string, headless_mode: bool, skip_perms: bool, timeout_ms: int) -> Process_Result, string, string, bool {
@@ -823,7 +870,8 @@ LOG,
     }
 
     // Parse the response to determine success/failure
-    response := trim(out_str);
+    // First, clean the output to handle binary/garbled data from script command
+    response := clean_terminal_output(trim(out_str));
     result.reasoning = copy_string(response);
 
     // Look for SUCCESS: or FAILURE: at the start of a line
