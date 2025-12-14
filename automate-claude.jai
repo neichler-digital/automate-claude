@@ -166,18 +166,26 @@ clean_terminal_output :: (input: string) -> string {
 
         // Skip lines that are mostly non-printable (binary/garbled data)
         printable_count := 0;
+        high_byte_count := 0;  // Count bytes >= 128 (non-ASCII)
         total_count := 0;
         for i: 0..line.count-1 {
             c := line[i];
             total_count += 1;
-            // Count printable ASCII and common UTF-8 continuation bytes
+            // Count printable ASCII
             if (c >= 32 && c < 127) || c == #char "\t" || c == #char "\r" {
                 printable_count += 1;
+            }
+            // Count high bytes that are likely part of binary/garbled data
+            if cast,no_check(u8)c >= 128 {
+                high_byte_count += 1;
             }
         }
 
         // Skip lines where less than 50% is printable (likely binary)
         if total_count > 0 && printable_count * 100 / total_count < 50 continue;
+
+        // Skip lines with more than 10% high bytes (likely contains garbled/binary data)
+        if total_count > 0 && high_byte_count * 100 / total_count > 10 continue;
 
         // Add newline between lines
         if !first_line {
@@ -185,12 +193,29 @@ clean_terminal_output :: (input: string) -> string {
         }
         first_line = false;
 
-        // Copy the line, filtering out non-printable characters
-        for i: 0..line.count-1 {
+        // Copy the line, filtering out non-printable and high-byte characters
+        // Also skip ANSI escape sequences (ESC [ ... m)
+        i := 0;
+        while i < line.count {
             c := line[i];
+            // Check for ANSI escape sequence: ESC (0x1B) followed by '['
+            if c == 0x1B && i + 1 < line.count && line[i + 1] == #char "[" {
+                // Skip until we find a letter (command terminator)
+                i += 2;
+                while i < line.count {
+                    tc := line[i];
+                    i += 1;
+                    if (tc >= #char "A" && tc <= #char "Z") || (tc >= #char "a" && tc <= #char "z") {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // Only keep printable ASCII and tab
             if (c >= 32 && c < 127) || c == #char "\t" {
                 append(*builder, c);
             }
+            i += 1;
         }
     }
 
@@ -778,10 +803,14 @@ CheckResult :: struct {
 check_output_with_claude :: (command: string, output: string, headless_mode: bool, timeout_ms: int, run_number: int, output_dir: string) -> CheckResult {
     result: CheckResult;
 
-    // Truncate output if too long to avoid overwhelming the check command
+    // Clean and truncate output before sending to Claude
+    // This removes binary/garbled data that can confuse the check process
+    cleaned_output := clean_terminal_output(output);
+    defer free(cleaned_output);
+
     MAX_OUTPUT_LENGTH :: 50000;
-    truncated_output := output;
-    if output.count > MAX_OUTPUT_LENGTH {
+    truncated_output := cleaned_output;
+    if cleaned_output.count > MAX_OUTPUT_LENGTH {
         truncated_output.count = MAX_OUTPUT_LENGTH;
     }
 
