@@ -1313,6 +1313,7 @@ CONTENT,
                     // Build recovery command that tells Claude to continue the incomplete work
                     // Note: We don't include the original command string to avoid quoting issues
                     recovery_command := sprint("The previous command did not complete successfully. Read %/run_%.txt to see what was attempted and what may have been completed already. Continue the work from where it left off and complete any remaining tasks.", output_dir, global_run);
+                    defer free(recovery_command);
 
                     retry_output_filename := sprint("%/run_%_retry.txt", output_dir, global_run);
                     retry_start_time := current_time_monotonic();
@@ -1414,7 +1415,6 @@ CONTENT,
 
                     print("% [Run %/%] Retry output saved to: %\n", get_timestamp(), global_run, total_runs, retry_output_filename);
                     free(retry_output_filename);
-                    free(recovery_command);
 
                     // Check retry results
                     if retry_failed_to_launch {
