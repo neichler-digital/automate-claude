@@ -810,15 +810,22 @@ check_output_with_claude :: (command: string, output: string, headless_mode: boo
 
     MAX_OUTPUT_LENGTH :: 50000;
     truncated_output := cleaned_output;
+    was_truncated := false;
     if cleaned_output.count > MAX_OUTPUT_LENGTH {
+        // Take the LAST N bytes instead of first N bytes
+        // This ensures we see the completion status at the end
+        truncated_output.data = cleaned_output.data + (cleaned_output.count - MAX_OUTPUT_LENGTH);
         truncated_output.count = MAX_OUTPUT_LENGTH;
+        was_truncated = true;
     }
 
     // Build the check prompt
+    truncation_note := ifx was_truncated then "[NOTE: Output was truncated to show the LAST 50KB. The beginning may be cut off mid-sentence or missing context. Focus on the END of the output to determine if the task completed successfully.]\n\n" else "";
+
     check_prompt := sprint(#string PROMPT
 Analyze the following output from running the command: "%"
 
-Output:
+%Output:
 ---
 %
 ---
@@ -844,7 +851,7 @@ if additional tasks or todos were created that are intended to be handled in ano
 iteration
 
 Be strict: if there are errors, exceptions, or clear failure indicators, report FAILURE.
-PROMPT, command, truncated_output);
+PROMPT, command, truncation_note, truncated_output);
 
     defer free(check_prompt);
 
