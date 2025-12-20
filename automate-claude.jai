@@ -1227,12 +1227,177 @@ CONTENT,
             }
 
             if timeout_reached {
-                print("% !!! FAILURE !!!\n", get_timestamp());
-                print("% Run % FAILED: Command timed out after % minutes.\n", get_timestamp(), global_run, timeout_minutes);
-                print("% Completed runs: %\n", get_timestamp(), completed_runs);
-                print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
-                flush_and_wait();
-                return;
+                print("% !!! TIMEOUT !!!\n", get_timestamp());
+                print("% Run % timed out after % minutes.\n", get_timestamp(), global_run, timeout_minutes);
+                print("% [Run %/%] Attempting timeout recovery...\n", get_timestamp(), global_run, total_runs);
+
+                // Build timeout recovery command that tells Claude to continue the work
+                timeout_recovery_command := sprint("The previous command timed out after % minutes. Read %/run_%.txt to see the output that was generated before the timeout. Attempt to carry on the work and complete any remaining tasks. The work should be done as if you are running the implement-work command.", timeout_minutes, output_dir, global_run);
+                defer free(timeout_recovery_command);
+
+                timeout_retry_output_filename := sprint("%/run_%_timeout_retry.txt", output_dir, global_run);
+                timeout_retry_start_time := current_time_monotonic();
+
+                // Variables for timeout retry run
+                timeout_retry_exit_code: s32 = 0;
+                timeout_retry_failed_to_launch := false;
+                timeout_retry_timeout_reached := false;
+                timeout_retry_output_string: string;
+                timeout_retry_error_string: string;
+
+                if live_mode {
+                    // Live mode timeout retry with streaming
+                    timeout_retry_log_file, timeout_retry_ok := file_open(timeout_retry_output_filename, for_writing = true);
+                    if !timeout_retry_ok {
+                        print("% [Run %/%] ERROR: Failed to open timeout retry log file: %\n", get_timestamp(), global_run, total_runs, timeout_retry_output_filename);
+                        print("% Stopping execution.\n", get_timestamp());
+                        print("% Completed runs: %\n", get_timestamp(), completed_runs);
+                        print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
+                        flush_and_wait();
+                        return;
+                    }
+
+                    timeout_retry_header := sprint("=== Claude Run % of % (TIMEOUT RETRY - LIVE STREAMING) ===\nOriginal Command: %\nTimeout Recovery Command: %\n=========================\n\n", global_run, total_runs, command, timeout_recovery_command);
+                    file_write(*timeout_retry_log_file, timeout_retry_header);
+                    free(timeout_retry_header);
+
+                    print("% --- Live streaming timeout retry output (also writing to %) ---\n", get_timestamp(), timeout_retry_output_filename);
+
+                    timeout_retry_live_result := run_command_streaming(
+                        *timeout_retry_log_file,
+                        timeout_ms,
+                        timeout_recovery_command,
+                        headless_mode || skip_perms
+                    );
+
+                    timeout_retry_exit_code = timeout_retry_live_result.exit_code;
+                    timeout_retry_failed_to_launch = timeout_retry_live_result.failed_to_launch;
+                    timeout_retry_timeout_reached = timeout_retry_live_result.timeout_reached;
+                    timeout_retry_output_string = timeout_retry_live_result.stdout_output;
+                    timeout_retry_error_string = timeout_retry_live_result.stderr_output;
+
+                    timeout_retry_end_time := current_time_monotonic();
+                    timeout_retry_elapsed := to_float64_seconds(timeout_retry_end_time - timeout_retry_start_time);
+                    timeout_retry_footer := sprint("\n=== END TIMEOUT RETRY RUN % (% seconds, exit: %) ===\n", global_run, timeout_retry_elapsed, timeout_retry_exit_code);
+                    file_write(*timeout_retry_log_file, timeout_retry_footer);
+                    free(timeout_retry_footer);
+
+                    file_close(*timeout_retry_log_file);
+                    print("% --- End timeout retry output ---\n", get_timestamp());
+                } else {
+                    // Normal mode timeout retry
+                    timeout_retry_result, timeout_retry_out_str, timeout_retry_err_str, timeout_retry_timed_out := run_claude_via_script(timeout_recovery_command, headless_mode, skip_perms, timeout_ms);
+
+                    timeout_retry_exit_code = timeout_retry_result.exit_code;
+                    timeout_retry_failed_to_launch = (timeout_retry_result.type == .FAILED_TO_LAUNCH);
+                    timeout_retry_timeout_reached = timeout_retry_timed_out;
+                    timeout_retry_output_string = timeout_retry_out_str;
+                    timeout_retry_error_string = timeout_retry_err_str;
+                }
+
+                timeout_retry_end_time := current_time_monotonic();
+                timeout_retry_elapsed_seconds := to_float64_seconds(timeout_retry_end_time - timeout_retry_start_time);
+
+                // Write timeout retry output if not in live mode
+                if !live_mode {
+                    timeout_retry_output_content := sprint(
+                        #string CONTENT
+=== Claude Run % of % (TIMEOUT RETRY) ===
+Original Command: %
+Timeout Recovery Command: %
+Exit Code: %
+Timeout: %
+Duration: % seconds
+=========================
+
+--- STDOUT ---
+%
+
+--- STDERR ---
+%
+
+=== END TIMEOUT RETRY RUN % (% seconds) ===
+CONTENT,
+                        global_run, total_runs,
+                        command,
+                        timeout_recovery_command,
+                        timeout_retry_exit_code,
+                        ifx timeout_retry_timeout_reached then "YES" else "NO",
+                        timeout_retry_elapsed_seconds,
+                        timeout_retry_output_string,
+                        timeout_retry_error_string,
+                        global_run, timeout_retry_elapsed_seconds
+                    );
+
+                    write_entire_file(timeout_retry_output_filename, timeout_retry_output_content);
+                    free(timeout_retry_output_content);
+                }
+
+                print("% [Run %/%] Timeout retry output saved to: %\n", get_timestamp(), global_run, total_runs, timeout_retry_output_filename);
+                free(timeout_retry_output_filename);
+
+                // Check timeout retry results - if retry also fails, exit
+                if timeout_retry_failed_to_launch {
+                    print("% !!! TIMEOUT RETRY FAILED !!!\n", get_timestamp());
+                    print("% Run % timeout retry FAILED: Could not launch claude command.\n", get_timestamp(), global_run);
+                    print("% Completed runs: %\n", get_timestamp(), completed_runs);
+                    print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
+                    flush_and_wait();
+                    return;
+                }
+
+                if timeout_retry_timeout_reached {
+                    print("% !!! TIMEOUT RETRY FAILED !!!\n", get_timestamp());
+                    print("% Run % timeout retry also timed out after % minutes.\n", get_timestamp(), global_run, timeout_minutes);
+                    print("% Stopping execution after second timeout.\n", get_timestamp());
+                    print("% Completed runs: %\n", get_timestamp(), completed_runs);
+                    print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
+                    flush_and_wait();
+                    return;
+                }
+
+                if timeout_retry_exit_code != 0 {
+                    print("% !!! TIMEOUT RETRY FAILED !!!\n", get_timestamp());
+                    print("% Run % timeout retry FAILED: Exit code %\n", get_timestamp(), global_run, timeout_retry_exit_code);
+                    print("% Completed runs: %\n", get_timestamp(), completed_runs);
+                    print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
+                    flush_and_wait();
+                    return;
+                }
+
+                // Check the timeout retry output with Claude
+                print("% [Run %/%] Checking timeout retry output with Claude...\n", get_timestamp(), global_run, total_runs);
+                timeout_retry_check_result := check_output_with_claude(timeout_recovery_command, timeout_retry_output_string, headless_mode, timeout_ms, global_run, output_dir);
+
+                if timeout_retry_check_result.check_failed {
+                    print("% !!! TIMEOUT RETRY CHECK FAILED !!!\n", get_timestamp());
+                    print("% Run % timeout retry check could not be performed: %\n", get_timestamp(), global_run, timeout_retry_check_result.reasoning);
+                    print("% Stopping execution.\n", get_timestamp());
+                    print("% Completed runs: %\n", get_timestamp(), completed_runs);
+                    print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
+                    flush_and_wait();
+                    return;
+                }
+
+                if !timeout_retry_check_result.success {
+                    print("% !!! TIMEOUT RETRY VERIFICATION FAILED !!!\n", get_timestamp());
+                    print("% Run % timeout retry did NOT complete successfully according to Claude.\n", get_timestamp(), global_run);
+                    print("% Reason: %\n", get_timestamp(), timeout_retry_check_result.reasoning);
+                    print("% Stopping execution after failed timeout retry.\n", get_timestamp());
+                    print("% Completed runs: %\n", get_timestamp(), completed_runs);
+                    print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
+                    flush_and_wait();
+                    return;
+                }
+
+                // Timeout recovery succeeded!
+                print("% [Run %/%] Timeout retry verification: SUCCESS\n", get_timestamp(), global_run, total_runs);
+                print("% [Run %/%] Work completed after timeout recovery!\n", get_timestamp(), global_run, total_runs);
+                free(timeout_retry_check_result.reasoning);
+
+                // Update timing to include recovery time and set output_string for later checks
+                elapsed_seconds = timeout_retry_elapsed_seconds;
+                output_string = timeout_retry_output_string;
             }
 
             if exit_code != 0 {
@@ -1314,82 +1479,88 @@ CONTENT,
                     print("% Reason: %\n", get_timestamp(), check_result.reasoning);
                     print("% Check %/run_%.txt for details.\n", get_timestamp(), output_dir, global_run);
 
-                    // Attempt automatic recovery by running a retry command
-                    print("% [Run %/%] Attempting automatic recovery...\n", get_timestamp(), global_run, total_runs);
+                    // Retry loop - keep retrying until success
+                    retry_attempt := 0;
+                    retry_succeeded := false;
 
-                    // Build recovery command that tells Claude to continue the incomplete work
-                    // Note: We don't include the original command string to avoid quoting issues
-                    recovery_command := sprint("The previous command did not complete successfully. Read %/run_%.txt to see what was attempted and what may have been completed already. Continue the work from where it left off and complete any remaining tasks.", output_dir, global_run);
-                    defer free(recovery_command);
+                    while !retry_succeeded {
+                        retry_attempt += 1;
 
-                    retry_output_filename := sprint("%/run_%_retry.txt", output_dir, global_run);
-                    retry_start_time := current_time_monotonic();
+                        // Attempt automatic recovery by running a retry command
+                        print("% [Run %/%] === RETRY ATTEMPT % ===\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                        print("% [Run %/%] Attempting automatic recovery...\n", get_timestamp(), global_run, total_runs);
 
-                    // Variables for retry run
-                    retry_exit_code: s32 = 0;
-                    retry_failed_to_launch := false;
-                    retry_timeout_reached := false;
-                    retry_output_string: string;
-                    retry_error_string: string;
+                        // Build recovery command that tells Claude to continue the incomplete work
+                        // Note: We don't include the original command string to avoid quoting issues
+                        recovery_command := sprint("The previous command did not complete successfully. Read %/run_%.txt to see what was attempted and what may have been completed already. Continue the work from where it left off and complete any remaining tasks.", output_dir, global_run);
 
-                    if live_mode {
-                        // Live mode retry with streaming
-                        retry_log_file, retry_ok := file_open(retry_output_filename, for_writing = true);
-                        if !retry_ok {
-                            print("% [Run %/%] ERROR: Failed to open retry log file: %\n", get_timestamp(), global_run, total_runs, retry_output_filename);
-                            print("% Stopping execution.\n", get_timestamp());
-                            print("% Completed runs: %\n", get_timestamp(), completed_runs);
-                            print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
-                            flush_and_wait();
-                            return;
+                        retry_output_filename := sprint("%/run_%_retry_%.txt", output_dir, global_run, retry_attempt);
+                        retry_start_time := current_time_monotonic();
+
+                        // Variables for retry run
+                        retry_exit_code: s32 = 0;
+                        retry_failed_to_launch := false;
+                        retry_timeout_reached := false;
+                        retry_output_string: string;
+                        retry_error_string: string;
+
+                        if live_mode {
+                            // Live mode retry with streaming
+                            retry_log_file, retry_ok := file_open(retry_output_filename, for_writing = true);
+                            if !retry_ok {
+                                print("% [Run %/%] ERROR: Failed to open retry log file: %\n", get_timestamp(), global_run, total_runs, retry_output_filename);
+                                print("% Will retry again...\n", get_timestamp());
+                                free(recovery_command);
+                                free(retry_output_filename);
+                                continue;  // Try again
+                            }
+
+                            retry_header := sprint("=== Claude Run % of % (RETRY ATTEMPT % - LIVE STREAMING) ===\nOriginal Command: %\nRecovery Command: %\n=========================\n\n", global_run, total_runs, retry_attempt, command, recovery_command);
+                            file_write(*retry_log_file, retry_header);
+                            free(retry_header);
+
+                            print("% --- Live streaming retry output (also writing to %) ---\n", get_timestamp(), retry_output_filename);
+
+                            retry_live_result := run_command_streaming(
+                                *retry_log_file,
+                                timeout_ms,
+                                recovery_command,
+                                headless_mode || skip_perms
+                            );
+
+                            retry_exit_code = retry_live_result.exit_code;
+                            retry_failed_to_launch = retry_live_result.failed_to_launch;
+                            retry_timeout_reached = retry_live_result.timeout_reached;
+                            retry_output_string = retry_live_result.stdout_output;
+                            retry_error_string = retry_live_result.stderr_output;
+
+                            retry_end_time := current_time_monotonic();
+                            retry_elapsed := to_float64_seconds(retry_end_time - retry_start_time);
+                            retry_footer := sprint("\n=== END RETRY ATTEMPT % RUN % (% seconds, exit: %) ===\n", retry_attempt, global_run, retry_elapsed, retry_exit_code);
+                            file_write(*retry_log_file, retry_footer);
+                            free(retry_footer);
+
+                            file_close(*retry_log_file);
+                            print("% --- End retry output ---\n", get_timestamp());
+                        } else {
+                            // Normal mode retry
+                            retry_result, retry_out_str, retry_err_str, retry_timed_out := run_claude_via_script(recovery_command, headless_mode, skip_perms, timeout_ms);
+
+                            retry_exit_code = retry_result.exit_code;
+                            retry_failed_to_launch = (retry_result.type == .FAILED_TO_LAUNCH);
+                            retry_timeout_reached = retry_timed_out;
+                            retry_output_string = retry_out_str;
+                            retry_error_string = retry_err_str;
                         }
 
-                        retry_header := sprint("=== Claude Run % of % (RETRY - LIVE STREAMING) ===\nOriginal Command: %\nRecovery Command: %\n=========================\n\n", global_run, total_runs, command, recovery_command);
-                        file_write(*retry_log_file, retry_header);
-                        free(retry_header);
-
-                        print("% --- Live streaming retry output (also writing to %) ---\n", get_timestamp(), retry_output_filename);
-
-                        retry_live_result := run_command_streaming(
-                            *retry_log_file,
-                            timeout_ms,
-                            recovery_command,
-                            headless_mode || skip_perms
-                        );
-
-                        retry_exit_code = retry_live_result.exit_code;
-                        retry_failed_to_launch = retry_live_result.failed_to_launch;
-                        retry_timeout_reached = retry_live_result.timeout_reached;
-                        retry_output_string = retry_live_result.stdout_output;
-                        retry_error_string = retry_live_result.stderr_output;
-
                         retry_end_time := current_time_monotonic();
-                        retry_elapsed := to_float64_seconds(retry_end_time - retry_start_time);
-                        retry_footer := sprint("\n=== END RETRY RUN % (% seconds, exit: %) ===\n", global_run, retry_elapsed, retry_exit_code);
-                        file_write(*retry_log_file, retry_footer);
-                        free(retry_footer);
+                        retry_elapsed_seconds := to_float64_seconds(retry_end_time - retry_start_time);
 
-                        file_close(*retry_log_file);
-                        print("% --- End retry output ---\n", get_timestamp());
-                    } else {
-                        // Normal mode retry
-                        retry_result, retry_out_str, retry_err_str, retry_timed_out := run_claude_via_script(recovery_command, headless_mode, skip_perms, timeout_ms);
-
-                        retry_exit_code = retry_result.exit_code;
-                        retry_failed_to_launch = (retry_result.type == .FAILED_TO_LAUNCH);
-                        retry_timeout_reached = retry_timed_out;
-                        retry_output_string = retry_out_str;
-                        retry_error_string = retry_err_str;
-                    }
-
-                    retry_end_time := current_time_monotonic();
-                    retry_elapsed_seconds := to_float64_seconds(retry_end_time - retry_start_time);
-
-                    // Write retry output if not in live mode
-                    if !live_mode {
-                        retry_output_content := sprint(
-                            #string CONTENT
-=== Claude Run % of % (RETRY) ===
+                        // Write retry output if not in live mode
+                        if !live_mode {
+                            retry_output_content := sprint(
+                                #string CONTENT
+=== Claude Run % of % (RETRY ATTEMPT %) ===
 Original Command: %
 Recovery Command: %
 Exit Code: %
@@ -1403,144 +1574,139 @@ Duration: % seconds
 --- STDERR ---
 %
 
-=== END RETRY RUN % (% seconds) ===
+=== END RETRY ATTEMPT % RUN % (% seconds) ===
 CONTENT,
-                            global_run, total_runs,
-                            command,
-                            recovery_command,
-                            retry_exit_code,
-                            ifx retry_timeout_reached then "YES" else "NO",
-                            retry_elapsed_seconds,
-                            retry_output_string,
-                            retry_error_string,
-                            global_run, retry_elapsed_seconds
-                        );
+                                global_run, total_runs, retry_attempt,
+                                command,
+                                recovery_command,
+                                retry_exit_code,
+                                ifx retry_timeout_reached then "YES" else "NO",
+                                retry_elapsed_seconds,
+                                retry_output_string,
+                                retry_error_string,
+                                retry_attempt, global_run, retry_elapsed_seconds
+                            );
 
-                        write_entire_file(retry_output_filename, retry_output_content);
-                        free(retry_output_content);
-                    }
-
-                    print("% [Run %/%] Retry output saved to: %\n", get_timestamp(), global_run, total_runs, retry_output_filename);
-                    free(retry_output_filename);
-
-                    // Check retry results
-                    if retry_failed_to_launch {
-                        print("% !!! RETRY FAILED !!!\n", get_timestamp());
-                        print("% Run % retry FAILED: Could not launch claude command.\n", get_timestamp(), global_run);
-                        print("% Completed runs: %\n", get_timestamp(), completed_runs);
-                        print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
-                        flush_and_wait();
-                        return;
-                    }
-
-                    if retry_timeout_reached {
-                        print("% !!! RETRY FAILED !!!\n", get_timestamp());
-                        print("% Run % retry FAILED: Command timed out after % minutes.\n", get_timestamp(), global_run, timeout_minutes);
-                        print("% Completed runs: %\n", get_timestamp(), completed_runs);
-                        print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
-                        flush_and_wait();
-                        return;
-                    }
-
-                    if retry_exit_code != 0 {
-                        print("% !!! RETRY FAILED !!!\n", get_timestamp());
-                        print("% Run % retry FAILED: Exit code %\n", get_timestamp(), global_run, retry_exit_code);
-                        print("% Completed runs: %\n", get_timestamp(), completed_runs);
-                        print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
-                    flush_and_wait();
-                    return;
-                }
-
-                    // Check the retry output with Claude
-                    print("% [Run %/%] Checking retry output with Claude...\n", get_timestamp(), global_run, total_runs);
-                    retry_check_result := check_output_with_claude(recovery_command, retry_output_string, headless_mode, timeout_ms, global_run, output_dir);
-
-                    if retry_check_result.check_failed {
-                        // Check if this is a rate limit issue
-                        retry_is_rate_limited, retry_reset_time, retry_timezone := check_for_rate_limit(retry_check_result.reasoning);
-
-                        if retry_is_rate_limited {
-                            waited := wait_for_rate_limit_reset(retry_reset_time, retry_timezone);
-                            free(retry_reset_time);
-                            if retry_timezone.count > 0 free(retry_timezone);
-
-                            if waited {
-                                print("% [Run %/%] Re-checking retry output after rate limit...\n", get_timestamp(), global_run, total_runs);
-                                free(retry_check_result.reasoning);
-                                retry_check_result = check_output_with_claude(recovery_command, retry_output_string, headless_mode, timeout_ms, global_run, output_dir);
-
-                                if !retry_check_result.check_failed {
-                                    if retry_check_result.success {
-                                        print("% [Run %/%] Retry verification: SUCCESS (after rate limit wait)\n", get_timestamp(), global_run, total_runs);
-                                        print("% [Run %/%] Work completed after retry!\n", get_timestamp(), global_run, total_runs);
-                                        free(retry_check_result.reasoning);
-                                        total_time_seconds += retry_elapsed_seconds;
-                                        // Skip to success path - need to break out of retry logic
-                                        // Set a flag or use different flow
-                                        completed_runs += 1;
-                                        total_time_seconds += elapsed_seconds;
-                                        print("% [Run %/%] Completed in % seconds (exit code: %)\n\n", get_timestamp(), global_run, total_runs, elapsed_seconds, exit_code);
-                                        continue;  // Move to next run
-                                    }
-                                    // Fall through to retry verification failed
-                                }
-                            }
+                            write_entire_file(retry_output_filename, retry_output_content);
+                            free(retry_output_content);
                         }
+
+                        print("% [Run %/%] Retry attempt % output saved to: %\n", get_timestamp(), global_run, total_runs, retry_attempt, retry_output_filename);
+                        free(retry_output_filename);
+
+                        // Check retry results - if failed to launch, timeout, or bad exit code, try again
+                        if retry_failed_to_launch {
+                            print("% !!! RETRY ATTEMPT % FAILED !!!\n", get_timestamp(), retry_attempt);
+                            print("% Run % retry FAILED: Could not launch claude command.\n", get_timestamp(), global_run);
+                            print("% Will retry again...\n", get_timestamp());
+                            free(recovery_command);
+                            continue;  // Try again
+                        }
+
+                        if retry_timeout_reached {
+                            print("% !!! RETRY ATTEMPT % FAILED !!!\n", get_timestamp(), retry_attempt);
+                            print("% Run % retry FAILED: Command timed out after % minutes.\n", get_timestamp(), global_run, timeout_minutes);
+                            print("% Will retry again...\n", get_timestamp());
+                            free(recovery_command);
+                            continue;  // Try again
+                        }
+
+                        if retry_exit_code != 0 {
+                            print("% !!! RETRY ATTEMPT % FAILED !!!\n", get_timestamp(), retry_attempt);
+                            print("% Run % retry FAILED: Exit code %\n", get_timestamp(), global_run, retry_exit_code);
+                            print("% Will retry again...\n", get_timestamp());
+                            free(recovery_command);
+                            continue;  // Try again
+                        }
+
+                        // Check the retry output with Claude
+                        print("% [Run %/%] Checking retry attempt % output with Claude...\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                        retry_check_result := check_output_with_claude(recovery_command, retry_output_string, headless_mode, timeout_ms, global_run, output_dir);
 
                         if retry_check_result.check_failed {
-                            print("% !!! RETRY CHECK FAILED !!!\n", get_timestamp());
-                            print("% Run % retry check could not be performed: %\n", get_timestamp(), global_run, retry_check_result.reasoning);
-                            print("% Stopping execution.\n", get_timestamp());
-                            print("% Completed runs: %\n", get_timestamp(), completed_runs);
-                            print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
-                            flush_and_wait();
-                            return;
-                        }
-                    }
+                            // Check if this is a rate limit issue
+                            retry_is_rate_limited, retry_reset_time, retry_timezone := check_for_rate_limit(retry_check_result.reasoning);
 
-                    if !retry_check_result.success {
-                        // Check if the failure reason contains rate limit info
-                        fail_is_rate_limited, fail_reset_time, fail_timezone := check_for_rate_limit(retry_check_result.reasoning);
+                            if retry_is_rate_limited {
+                                waited := wait_for_rate_limit_reset(retry_reset_time, retry_timezone);
+                                free(retry_reset_time);
+                                if retry_timezone.count > 0 free(retry_timezone);
 
-                        if fail_is_rate_limited {
-                            waited := wait_for_rate_limit_reset(fail_reset_time, fail_timezone);
-                            free(fail_reset_time);
-                            if fail_timezone.count > 0 free(fail_timezone);
-
-                            if waited {
-                                print("% [Run %/%] Re-checking retry output after rate limit...\n", get_timestamp(), global_run, total_runs);
-                                free(retry_check_result.reasoning);
-                                retry_check_result = check_output_with_claude(recovery_command, retry_output_string, headless_mode, timeout_ms, global_run, output_dir);
-
-                                if !retry_check_result.check_failed && retry_check_result.success {
-                                    print("% [Run %/%] Retry verification: SUCCESS (after rate limit wait)\n", get_timestamp(), global_run, total_runs);
-                                    print("% [Run %/%] Work completed after retry!\n", get_timestamp(), global_run, total_runs);
+                                if waited {
+                                    print("% [Run %/%] Re-checking retry output after rate limit...\n", get_timestamp(), global_run, total_runs);
                                     free(retry_check_result.reasoning);
-                                    total_time_seconds += retry_elapsed_seconds;
-                                    completed_runs += 1;
-                                    total_time_seconds += elapsed_seconds;
-                                    print("% [Run %/%] Completed in % seconds (exit code: %)\n\n", get_timestamp(), global_run, total_runs, elapsed_seconds, exit_code);
-                                    continue;  // Move to next run
+                                    retry_check_result = check_output_with_claude(recovery_command, retry_output_string, headless_mode, timeout_ms, global_run, output_dir);
+
+                                    if !retry_check_result.check_failed {
+                                        if retry_check_result.success {
+                                            print("% [Run %/%] Retry attempt % verification: SUCCESS (after rate limit wait)\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                                            print("% [Run %/%] Work completed after % retry attempts!\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                                            free(retry_check_result.reasoning);
+                                            total_time_seconds += retry_elapsed_seconds;
+                                            retry_succeeded = true;
+                                            free(recovery_command);
+                                            break;  // Exit retry loop
+                                        }
+                                        // Fall through to retry verification failed
+                                    }
                                 }
+                            }
+
+                            if retry_check_result.check_failed {
+                                print("% !!! RETRY ATTEMPT % CHECK FAILED !!!\n", get_timestamp(), retry_attempt);
+                                print("% Run % retry check could not be performed: %\n", get_timestamp(), global_run, retry_check_result.reasoning);
+                                print("% Will retry again...\n", get_timestamp());
+                                free(retry_check_result.reasoning);
+                                free(recovery_command);
+                                continue;  // Try again
                             }
                         }
 
-                        print("% !!! RETRY VERIFICATION FAILED !!!\n", get_timestamp());
-                        print("% Run % retry did NOT complete successfully according to Claude.\n", get_timestamp(), global_run);
-                        print("% Reason: %\n", get_timestamp(), retry_check_result.reasoning);
-                        print("% Stopping execution after failed retry.\n", get_timestamp());
-                        print("% Completed runs: %\n", get_timestamp(), completed_runs);
-                        print("% Total time: % seconds\n", get_timestamp(), total_time_seconds);
-                        flush_and_wait();
-                        return;
-                    }
+                        if !retry_check_result.success {
+                            // Check if the failure reason contains rate limit info
+                            fail_is_rate_limited, fail_reset_time, fail_timezone := check_for_rate_limit(retry_check_result.reasoning);
 
-                    print("% [Run %/%] Retry verification: SUCCESS\n", get_timestamp(), global_run, total_runs);
-                    print("% [Run %/%] Work completed after retry!\n", get_timestamp(), global_run, total_runs);
-                    free(retry_check_result.reasoning);
+                            if fail_is_rate_limited {
+                                waited := wait_for_rate_limit_reset(fail_reset_time, fail_timezone);
+                                free(fail_reset_time);
+                                if fail_timezone.count > 0 free(fail_timezone);
 
-                    // Update total time to include retry time
-                    total_time_seconds += retry_elapsed_seconds;
+                                if waited {
+                                    print("% [Run %/%] Re-checking retry output after rate limit...\n", get_timestamp(), global_run, total_runs);
+                                    free(retry_check_result.reasoning);
+                                    retry_check_result = check_output_with_claude(recovery_command, retry_output_string, headless_mode, timeout_ms, global_run, output_dir);
+
+                                    if !retry_check_result.check_failed && retry_check_result.success {
+                                        print("% [Run %/%] Retry attempt % verification: SUCCESS (after rate limit wait)\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                                        print("% [Run %/%] Work completed after % retry attempts!\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                                        free(retry_check_result.reasoning);
+                                        total_time_seconds += retry_elapsed_seconds;
+                                        retry_succeeded = true;
+                                        free(recovery_command);
+                                        break;  // Exit retry loop
+                                    }
+                                }
+                            }
+
+                            print("% !!! RETRY ATTEMPT % VERIFICATION FAILED !!!\n", get_timestamp(), retry_attempt);
+                            print("% Run % retry did NOT complete successfully according to Claude.\n", get_timestamp(), global_run);
+                            print("% Reason: %\n", get_timestamp(), retry_check_result.reasoning);
+                            print("% Will retry again...\n", get_timestamp());
+                            free(retry_check_result.reasoning);
+                            free(recovery_command);
+                            continue;  // Try again
+                        }
+
+                        // Success!
+                        print("% [Run %/%] Retry attempt % verification: SUCCESS\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                        print("% [Run %/%] Work completed after % retry attempts!\n", get_timestamp(), global_run, total_runs, retry_attempt);
+                        free(retry_check_result.reasoning);
+
+                        // Update total time to include retry time
+                        total_time_seconds += retry_elapsed_seconds;
+                        retry_succeeded = true;
+                        free(recovery_command);
+                    }  // End retry while loop
                 }
 
                 print("% [Run %/%] AI verification: SUCCESS\n", get_timestamp(), global_run, total_runs);
